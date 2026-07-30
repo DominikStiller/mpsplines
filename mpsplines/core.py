@@ -26,7 +26,7 @@ from scipy import optimize
 from loguru import logger
 
 try:
-    from scipy.sparse import csc_matrix, csr_matrix, linalg
+    from scipy.sparse import csc_matrix, linalg
     USE_SPARSE_MATRICES = True
 except ImportError:
     from scipy import linalg
@@ -66,50 +66,71 @@ def second_order_unconstrained_interpolation(xi, yi, x_edges, periodic=False):
     #   A X = B
     # where A is a square matrix of size n_coefs * n_samples and B is a
     # column matrix of size n_coefs * n_samples. This system of equations
-    # renders the continuity of the splines and the preservation of the mean
-    A = np.zeros((n_samples * n_coefs, n_samples * n_coefs), dtype=np.float64)
-    B = np.zeros(n_samples * n_coefs, dtype=np.float64)
+    # renders the continuity of the splines and the preservation of the mean.
+    # A has at most 2 * n_coefs entries per row, so it is assembled in
+    # coordinate format (rows, cols, vals) rather than as a dense matrix,
+    # whose allocation and conversion to sparse cost O(n_samples**2)
+    n_size = n_samples * n_coefs
+
+    B = np.zeros(n_size, dtype=np.float64)
+    B[:n_samples] = yi
 
     Dx2 = Dx**2
     Dxu2 = Dxu**2
     Dxl2 = Dxl**2
 
+    ones = np.ones(n_samples - 1)
+    zeros = np.zeros(n_samples - 1)
+    # columns i*n_coefs..(i+2)*n_coefs for the rows that couple the
+    # splines i and i+1
+    pair_cols = (n_coefs*np.arange(n_samples - 1)[:, None]
+                 + np.arange(2*n_coefs)).ravel()
+
     # conditions to preserve the mean...
-    for i in range(n_samples):
-        A[i, i*n_coefs:(i+1)*n_coefs] = [
-            Dx2[i]/3. + Dxl[i]*Dxu[i], Dx[i]/2. + Dxl[i], 1.]
-    B[:n_samples] = yi
+    mean_rows = np.repeat(np.arange(n_samples), n_coefs)
+    mean_cols = np.arange(n_size)
+    mean_vals = np.stack(
+        [Dx2/3. + Dxl*Dxu, Dx/2. + Dxl, np.ones(n_samples)], axis=1).ravel()
 
     # conditions to preserve the splines continuity...
-    for i in range(n_samples - 1):
-        A[i+n_samples, i*n_coefs:(i+2)*n_coefs] = [
-            Dxu2[i], Dxu[i], 1., -Dxl2[i+1], -Dxl[i+1], -1.
-        ]
+    cont_rows = np.repeat(np.arange(n_samples, 2*n_samples - 1), 2*n_coefs)
+    cont_vals = np.stack(
+        [Dxu2[:-1], Dxu[:-1], ones, -Dxl2[1:], -Dxl[1:], -ones], axis=1).ravel()
 
     # conditions to preserve the first derivative continuity...
-    for i in range(n_samples - 1):
-        A[i+2*n_samples, i*n_coefs:(i+2)*n_coefs] = [
-            2*Dxu[i], 1., 0., -2*Dxl[i+1], -1, 0.
-        ]
+    deriv_rows = np.repeat(np.arange(2*n_samples, 3*n_samples - 1), 2*n_coefs)
+    deriv_vals = np.stack(
+        [2*Dxu[:-1], ones, zeros, -2*Dxl[1:], -ones, zeros], axis=1).ravel()
 
+    bound_rows = np.repeat([2*n_samples - 1, 3*n_samples - 1], 2*n_coefs)
     if periodic is True:
-        # conditions to preserve the splines continuity...
-        A[2*n_samples-1, -n_coefs:] = [Dxu2[-1], Dxu[-1], 1.]
-        A[2*n_samples-1, :n_coefs] = [-Dxl2[0], -Dxl[0], -1.]
-        # conditions to preserve the first derivative continuity...
-        A[3*n_samples-1, -n_coefs:] = [2*Dxu[-1], 1., 0.]
-        A[3*n_samples-1, :n_coefs] = [-2*Dxl[0], -1., 0.]
+        bound_cols = np.tile(np.r_[np.arange(n_size - n_coefs, n_size),
+                                   np.arange(n_coefs)], 2)
+        bound_vals = np.array([
+            # conditions to preserve the splines continuity...
+            Dxu2[-1], Dxu[-1], 1., -Dxl2[0], -Dxl[0], -1.,
+            # conditions to preserve the first derivative continuity...
+            2*Dxu[-1], 1., 0., -2*Dxl[0], -1., 0.])
     else:
         # assume the second derivative is conserved in the two
         # leftmost and rightmost splines
-        A[2*n_samples-1, :2*n_coefs] = [1., 0., 0., -1., 0., 0.]
-        A[3*n_samples-1, -2*n_coefs:] = [1., 0., 0., -1., 0., 0.]
+        bound_cols = np.r_[np.arange(2*n_coefs),
+                           np.arange(n_size - 2*n_coefs, n_size)]
+        bound_vals = np.array([1., 0., 0., -1., 0., 0.,
+                               1., 0., 0., -1., 0., 0.])
+
+    rows = np.r_[mean_rows, cont_rows, deriv_rows, bound_rows]
+    cols = np.r_[mean_cols, pair_cols, pair_cols, bound_cols]
+    vals = np.r_[mean_vals, cont_vals, deriv_vals, bound_vals]
 
     if USE_SPARSE_MATRICES is True:  # much faster
-        As = csc_matrix(A, dtype=np.float64)
-        Bs = csr_matrix(B, dtype=np.float64).T
-        return np.reshape(linalg.spsolve(As, Bs), (n_samples, n_coefs))
+        nonzero = vals != 0.
+        As = csc_matrix((vals[nonzero], (rows[nonzero], cols[nonzero])),
+                        shape=(n_size, n_size), dtype=np.float64)
+        return np.reshape(linalg.spsolve(As, B), (n_samples, n_coefs))
     else:
+        A = np.zeros((n_size, n_size), dtype=np.float64)
+        A[rows, cols] = vals
         return np.reshape(linalg.solve(A, B), (n_samples, n_coefs))
 
 
@@ -466,14 +487,10 @@ class MeanPreservingInterpolation(object):
             x_ = x_.astype('datetime64[ns]')
         x_ = x_.astype(np.float64)
 
-        y = np.empty_like(x_)
         ind = np.clip(np.digitize(x_, self.x_edges)-1, 0, self.n_samples-1)
-        for i in range(self.n_samples):
-            universe = ind == i
-            dx = x_[universe] - self.xi[i]
-            y[universe] = (
-                self.P[i, 0]*(dx**3) + self.P[i, 1]*(dx**2) +
-                self.P[i, 2]*dx + self.P[i, 3])
+        dx = x_ - self.xi[ind]
+        P = self.P[ind]
+        y = P[:, 0]*(dx**3) + P[:, 1]*(dx**2) + P[:, 2]*dx + P[:, 3]
 
         if self.min_val is None:
             return y
